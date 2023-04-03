@@ -44,8 +44,12 @@ CSocket::CSocket()
     //pthread_mutex_init(&m_recvMessageQueueMutex, NULL); //互斥量初始化
     
     //队列相关
-    m_iSendMsgQueueCount = 0;      //发消息队列大小
-    m_total_recyconnection_n = 0;  //待释放连接队列大小
+    m_iSendMsgQueueCount     = 0;      //发消息队列大小
+    m_total_recyconnection_n = 0;      //待释放连接队列大小
+    
+    m_cur_size_              = 0;      //当前计时队列大小
+    m_timer_value_           = 0;      //当前计时队列头部时间值
+    m_onlineUserCount        = 0;      //用户在线人数
     return ;
 }
 
@@ -84,6 +88,16 @@ void CSocket::ReadConf()
     m_ListenPortCount        = pConfig->GetIntDefault("ListenPortCount", m_ListenPortCount);
     m_worker_connections     = pConfig->GetIntDefault("worker_connections",m_worker_connections);
     m_RecyConnectionWaitTime = pConfig->GetIntDefault("Sock_RecyConnectionWaitTime",m_RecyConnectionWaitTime);
+    
+    m_ifkickTimeCount        = pConfig->GetIntDefault("Sock_WaitTimeEnable",0);
+    m_iWaitTime              = pConfig->GetIntDefault("Sock_MaxWaitTime",m_iWaitTime);
+    m_iWaitTime              = (m_iWaitTime > 5)?m_iWaitTime:5;                          //最少5s
+    m_ifTimeOutKick          = pConfig->GetIntDefault("Sock_TimeOutKick",0);
+    
+    m_floodAkEnable          = pConfig->GetIntDefault("Sock_FloodAttackKickEnable",0);
+    m_floodTimeInterval      = pConfig->GetIntDefault("Sock_FloodTimeInterval",100);
+    m_floodKickCount         = pConfig->GetIntDefault("Sock_FloodKickCounter",10);
+    
     return;
 }
 
@@ -104,46 +118,82 @@ bool CSocket::Initialize_subproc()
 	//发消息互斥量
 	if(pthread_mutex_init(&m_sendMessageQueueMutex, NULL) != 0)
 	{
-		ngx_log_stderr(0,"CSocekt::Initialize()中pthread_mutex_init(&m_sendMessageQueueMutex)失败.");
+		ngx_log_stderr(0,"CSocekt::Initialize_subproc()中pthread_mutex_init(&m_sendMessageQueueMutex)失败.");
         return false; 
 	}
 	
 	//连接相关互斥量初始化
 	if(pthread_mutex_init(&m_connectionMutex, NULL) != 0)
 	{
-		ngx_log_stderr(0,"CSocekt::Initialize()中pthread_mutex_init(&m_connectionMutex)失败.");
+		ngx_log_stderr(0,"CSocekt::Initialize_subproc()中pthread_mutex_init(&m_connectionMutex)失败.");
         return false;    
 	}
 	
 	//回收消息互斥量
 	if(pthread_mutex_init(&m_recyconnqueueMutex, NULL)  != 0)
     {
-        ngx_log_stderr(0,"CSocekt::Initialize()中pthread_mutex_init(&m_recyconnqueueMutex)失败.");
+        ngx_log_stderr(0,"CSocekt::Initialize_subproc()中pthread_mutex_init(&m_recyconnqueueMutex)失败.");
         return false;    
     } 
+    
+    //时间相关互斥量初始化
+    if(pthread_mutex_init(&m_timequeueMutex,NULL) != 0)
+    {
+    	ngx_log_stderr(0,"CSocekt::Initialize_subproc()中pthread_mutex_init(&m_timequeueMutex)失败.");
+        return false;  
+    }
     
     //初始化发消息相关信号量
     if(sem_init(&m_semEventSendQueue,0,0) == -1)
     {
-        ngx_log_stderr(0,"CSocekt::Initialize()中sem_init(&m_semEventSendQueue,0,0)失败.");
+        ngx_log_stderr(0,"CSocekt::Initialize_subproc()中sem_init(&m_semEventSendQueue,0,0)失败.");
         return false;
     }
     
     //创建线程
     int err;
+    ThreadItem *pSendQueue;                      //用来发送数据的线程
+    m_threadVector.push_back(pSendQueue = new ThreadItem(this));
+    err = pthread_create(&pSendQueue->_Handle, NULL, ServerSendQueueThread,pSendQueue);
+    if(err != 0)
+    {
+    	ngx_log_stderr(0,"CSocekt::Initialize_subproc()pthread_create(&pSendQueue)失败.");
+        return false;
+    }
+    
     ThreadItem *pRecyconn;
     m_threadVector.push_back(pRecyconn = new ThreadItem(this)); 
     err = pthread_create(&pRecyconn->_Handle, NULL, ServerRecyConnectionThread,pRecyconn);
     if(err != 0)
     {
+    	ngx_log_stderr(0,"CSocekt::Initialize_subproc()pthread_create(&pRecyconn)失败.");
         return false;
     }
+    
+    if(m_ifkickTimeCount == 1)
+    {
+    	ThreadItem *pTimemonitor;
+    	m_threadVector.push_back(pTimemonitor = new ThreadItem(this));
+    	err = pthread_create(&pTimemonitor->_Handle,NULL,ServerTimerQueueMonitorThread,pTimemonitor);
+    	if(err != 0)
+    	{
+    		ngx_log_stderr(0,"CSocekt::Initialize_subproc()pthread_create(&pTimemonitor)失败.");
+    		return false;
+    	}
+    }
+    
 	return true;
 }
 
 //关闭退出函数[子进程中执行]
 void CSocket::Shutdown_subproc()
 {
+	//用到信号量，还需要调用一下sem_post
+	if(sem_post(&m_semEventSendQueue) == -1)
+	{
+		ngx_log_stderr(0,"CSocekt::Shutdown_subproc()中sem_post(&m_semEventSendQueue)失败.");
+	}
+	
 	//等待所有的线程结束
 	std::vector<ThreadItem*>::iterator iter;
 	for(iter = m_threadVector.begin(); iter != m_threadVector.end(); iter++)
@@ -164,11 +214,13 @@ void CSocket::Shutdown_subproc()
 	//队列相关
 	clearMsgSendQueue();
 	clearconnection();
+	clearAllFromTimerQueue();
 	
 	//多线程
 	pthread_mutex_destroy(&m_connectionMutex);         //TCP连接队列互斥量
 	pthread_mutex_destroy(&m_sendMessageQueueMutex);   //消息发送队列互斥量
 	pthread_mutex_destroy(&m_recyconnqueueMutex);      //待回收连接队列互斥量
+	pthread_mutex_destroy(&m_timequeueMutex);
 	sem_destroy(&m_semEventSendQueue);                 //信号互斥
 	return;
 }
@@ -318,6 +370,59 @@ void CSocket::msgSend(char *psendbuf)
 	return;
 }
 
+//主动关闭连接
+void CSocket::zdClosesocketProc(lpngx_connection_t pConn)
+{
+	if(m_ifkickTimeCount == 1)
+	{
+		DeleteFromTimerQueue(pConn);
+	}
+	if(pConn->fd != -1)
+	{
+		close(pConn->fd);
+		pConn->fd = -1;
+	}
+	
+	if(pConn->iThrowsendCount > 0)
+	{
+		--pConn->iThrowsendCount;
+	}
+	inRecyConnectQueue(pConn);
+	return;
+}
+
+//测试是否flood攻击成立，成功返回true，否返回false
+bool CSocket::TestFlood(lpngx_connection_t pConn)
+{
+	struct timeval sCurrTime;        //当前时间结构
+	uint64_t       iCurrTime;        //当前时间
+	bool           reco = false; 
+	
+	gettimeofday(&sCurrTime, NULL);  //获取当前时间
+	iCurrTime = (sCurrTime.tv_sec *1000 + sCurrTime.tv_usec / 1000);  //毫秒
+	if((iCurrTime - pConn->FloodkickLastTime) < m_floodTimeInterval)  //两次收到包的时间 < 100ms
+	{
+		//发包频繁记录
+		pConn->FloodAttackCount++;
+		pConn->FloodkickLastTime = iCurrTime;
+	}
+	else
+	{
+		//正常频率发包,记录恢复正常
+		pConn->FloodAttackCount = 0;
+		pConn->FloodkickLastTime = iCurrTime;
+	}
+	
+	//测试使用日志
+	//ngx_log_stderr(0,"pConn->FloodAttackCount=%d,m_floodKickCount=%d.",pConn->FloodAttackCount,m_floodKickCount);
+	
+	if(pConn->FloodAttackCount >= m_floodKickCount)
+	{
+		reco = true;                    //设置踢人标志
+	}
+	return reco;
+}
+
 //初始化epoll功能，在子进程调用
 int CSocket::ngx_epoll_init()
 {
@@ -332,34 +437,6 @@ int CSocket::ngx_epoll_init()
 	//(2)创建连接池【数组】、创建出来，这个东西后续用于处理所有客户端的连接
 	initconnection();
 	
-	/*m_connection_n = m_worker_connections;                //连接池大小
-	m_pconnections = new ngx_connection_t[m_connection_n];//申请连接池内存
-	
-	
-	//m_pread_events = new ngx_event_t[m_connection_n];
-	//m_pwrite_events = new ngx_event_t[m_connection_n];
-	for(int i=0; i<m_connection_n; i++)
-	{
-		m_pconnections[i].instance = 1;                   //失效标志位设成1：失效
-	}
-	
-	int i = m_connection_n ;                              //连接池中连接数
-	lpngx_connection_t next = NULL;                       //后继节点初始化为NULL
-	lpngx_connection_t c = m_pconnections;                //连接池数组首地址
-	
-	//初始化连接池
-	do
-	{
-		i--;
-		c[i].data = next;                                 //前插法
-		c[i].fd =-1;                                      //初始化无连接
-		c[i].instance = 1;                                //失效先置为1
-		c[i].iCurrsequence = 0;                           //序号从0开始
-		next = &c[i];                                     //指针前移
-	}while(i);//采用前插法
-	m_pfree_connections = next;                           //空闲链表头指针
-	m_free_connection_n = m_connection_n;                 //空闲连接池大小
-	*/
 	
 	std::vector<lpngx_listening_t>::iterator pos;
 	for(pos=m_ListenSocketList.begin(); pos != m_ListenSocketList.end(); ++pos)
@@ -388,66 +465,6 @@ int CSocket::ngx_epoll_init()
 	return 1;
 }
 
-/*
-//(2)监听端口开始工作，监听端口要开始工作，必须为其增加读事件，因为监听端口只关心读事件
-void CSocekt::ngx_epoll_listenportstart()
-{
-    std::vector<lpngx_listening_t>::iterator pos;	
-	for(pos = m_ListenSocketList.begin(); pos != m_ListenSocketList.end(); ++pos) //vector
-	{	
-        //本函数如果失败，直接退出
-        ngx_epoll_add_event((*pos)->fd,1,0); //只关心读事件
-    } //end for
-    return;
-}
-*/
-/*********************************************************************************************************************
-                epoll增加事件，可能被ngx_epoll_init()等函数调用
-                fd:句柄，一个socket
-                readevent：表示是否是个读事件，0是，1不是
-                writeevent：表示是否是个写事件，0是，1不是
-                otherflag：其他需要额外补充的标记，弄到这里
-                eventtype：事件类型  ，一般就是用系统的枚举值，增加，删除，修改等;
-                c：对应的连接池中的连接的指针
-                返回值：成功返回1，失败返回-1；
-**********************************************************************************************************************/
-/*int CSocket::ngx_epoll_add_event(int fd, int readevent, int writeevent, uint32_t otherflag, uint32_t eventtype, lpngx_connection_t c)
-{
-	struct epoll_event ev;
-	memset(&ev, 0, sizeof(ev));
-	
-	if(readevent == 1)
-	{
-		//读事件,官方nginx没有使用EPOLLERR，【有些范例中是使用EPOLLERR的】
-		ev.events = EPOLLIN|EPOLLRDHUP;//EPOLLIN读事件，也就是read ready,EPOLLRDHUP 客户端关闭连接，断连
-		
-		//只支持非阻塞socket的高速模式
-		//ET：边缘触发】，对于accetp来说，如果加这个EPOLLET，则客户端连入时，epoll_wait()只会返回一次该事件，
-		//EPOLLLT【水平触发：低速模式】，则客户端连入时，epoll_wait()会被触发多次，一直到用accept()来处理；
-		//ev.events |= (ev.events | EPOLLET);
-		
-	}
-	else
-	{
-		//其他事件待处理
-	}
-	
-	if(otherflag != 0)
-	{
-		ev.events |= otherflag; 
-	}
-	
-	ev.data.ptr = (void*)((uintptr_t)c | c->instance);//将对象放进去，后续来事件时，用epoll_wait()后，可将该对象取出来用
-	
-	if(epoll_ctl(m_epollhandle,eventtype,fd,&ev) == -1)
-	{
-		ngx_log_stderr(errno,"CSocket::ngx_epoll_add_event()中epoll_clt(%d,%d,%d,%u,%u)失败.",fd,readevent,writeevent,otherflag,eventtype);
-		return -1;
-	}
-	return 1;
-}*/
-
-
 /*****************************************************************************************************************
    参数说明：
    fd,               //句柄，一个socket
@@ -462,19 +479,38 @@ int CSocket::ngx_epoll_oper_event(int fd, uint32_t eventtype,uint32_t flag,int b
 	memset(&ev, 0, sizeof(ev));
 	if(eventtype == EPOLL_CTL_ADD)                         //往红黑树中增加节点
 	{
-		ev.data.ptr   = (void *)pConn;
+		//ev.data.ptr   = (void *)pConn;
 		ev.events     = flag;                              //设置标记
 		pConn->events = flag;                              //这个连接本身也记录这个标记
 	}
 	else if(eventtype == EPOLL_CTL_MOD)
 	{
 		//节点已经在红黑树中，修改节点的事件信息
+		ev.events = pConn->events;
+		if(bcaction == 0)
+		{
+			ev.events |=flag;                             //增加某标记
+		}
+		else if(bcaction == 1)
+		{
+			ev.events &= ~flag;                           //去掉标记
+		}
+		else
+		{
+			ev.events = flag;                              //覆盖整个记录
+		}
+		pConn->events = ev.events;                         //记录该事件
 	}
 	else
 	{
 		//删除红黑树中节点，目前没这个需求，所以将来再扩展
         return  1;  //先直接返回1表示成功	
 	}
+	
+	//内核epoll SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,		struct epoll_event __user *, event)
+	//copy_from_user(&epds, event, sizeof(struct epoll_event))),参数全覆盖
+	ev.data.ptr   = (void *)pConn;
+	
 	if(epoll_ctl(m_epollhandle,eventtype,fd,&ev) == -1)
 	{
 		ngx_log_stderr(errno,"CSocekt::ngx_epoll_oper_event()中epoll_ctl(%d,%ud,%ud,%d)失败.",fd,eventtype,flag,bcaction);    
@@ -516,26 +552,12 @@ int CSocket::ngx_epoll_process_events(int timer)
         return 0; //非正常返回 
 	}
 	
-	lpngx_connection_t c;
+	lpngx_connection_t pConn;
 	//uintptr_t          instance;
 	uint32_t           revents;
 	for(int i=0;i<events;i++)
 	{
-		c = (lpngx_connection_t)(m_events[i].data.ptr);
-		/*instance = (uintptr_t)c & 1;                             //取得是epoll_add_events()里面的值
-		c = (lpngx_connection_t) ((uintptr_t)c & (uintptr_t) ~1);
-		if(c->fd == -1)                                          //过滤过期事件
-		{
-			ngx_log_error_core(NGX_LOG_DEBUG,0,"CSocket::ngx_epoll_process_events()中遇到了fd =-1的过期事件:%p.",c);
-			continue;
-		}
-		
-		if(c->instance != instance)
-		{
-			 ngx_log_error_core(NGX_LOG_DEBUG,0,"CSocekt::ngx_epoll_process_events()中遇到了instance值改变的过期事件:%p.",c); 
-			 continue;
-		}*/
-		
+		pConn = (lpngx_connection_t)(m_events[i].data.ptr);
 		revents = m_events[i].events;                            //取出事件
 		
 		//EPOLLIN：表示对应的链接上有数据可以读出（TCP链接的远端主动关闭连接，也相当于可读事件，因为本服务器小处理发送来的FIN包）
@@ -548,15 +570,158 @@ int CSocket::ngx_epoll_process_events(int timer)
 		if(revents &EPOLLIN)                                     //读事件
 		{
 			//c->r_ready = 1;                                      //标记可以读；【从连接池拿出一个连接时这个连接的所有成员都是0】 
-			(this->* (c->rhandler))(c);
+			(this->* (pConn->rhandler))(pConn);
 		}
 		
-		if(revents & EPOLLOUT)        //暂不处理
+		if(revents & EPOLLOUT)                                   //写事件
 		{
-			 ngx_log_stderr(errno,"do nothing now from process events.");
+			if(revents & (EPOLLERR|EPOLLHUP|EPOLLRDHUP))         //客户端关闭了
+			{
+				--pConn->iThrowsendCount;
+			}
+			else
+			{
+				(this->*(pConn->whandler))(pConn);                
+			}
 		}
 		
 		
 	}//end for(int i=0;i<events;i++)
 	return 1;
+}
+
+//消息发送线程
+void *CSocket::ServerSendQueueThread(void * threadData)
+{
+	ThreadItem *pThread = static_cast<ThreadItem*>(threadData);
+	CSocket *pSocketObj = pThread->_pThis;
+	int err;
+	std::list<char *>::iterator pos,pos2,posend;
+		
+	char *pMsgBuf;
+	LPSTRUC_MSG_HEADER pMsgHeader;
+	LPCOMM_PKG_HEADER  pPkgHeader;
+	lpngx_connection_t pConn;
+	unsigned short     itmp;
+	ssize_t            sendsize;
+	
+	CMemory *pMemory = CMemory::GetInstance();
+		
+	while(g_stopEvent == 0)                        //程序运行状态
+	{
+		if(sem_wait(&pSocketObj->m_semEventSendQueue) == -1)
+		{
+			if(errno != EINTR)
+			{
+				ngx_log_stderr(errno,"CSocekt::ServerSendQueueThread()中sem_wait(&pSocketObj->m_semEventSendQueue)失败."); 
+			}
+		}
+		
+	    if(g_stopEvent != 0)                       //程序要求退出
+	    {
+	    	break;
+	    }
+	    
+	    if(pSocketObj->m_iSendMsgQueueCount > 0)
+	    {
+	    	err = pthread_mutex_lock(&pSocketObj->m_sendMessageQueueMutex);              //发送队列互斥
+	    	if(err != 0)
+	    	{
+	    		ngx_log_stderr(err,"CSocekt::ServerSendQueueThread()中pthread_mutex_lock()失败，返回的错误码为%d!",err);
+	    	}
+	    	
+	    	pos    = pSocketObj->m_MsgSendQueue.begin();
+	    	posend = pSocketObj->m_MsgSendQueue.end();
+	    	while(pos != posend)
+	    	{
+	    		pMsgBuf    = (*pos);                                                     //拿到消息  消息头+包头+包体
+	    		pMsgHeader = (LPSTRUC_MSG_HEADER)pMsgBuf;                                //取到消息头
+	    		pPkgHeader = (LPCOMM_PKG_HEADER)(pMsgBuf+pSocketObj->m_iLenMsgHeader);  //包头
+	    		pConn      = pMsgHeader->pConn;
+	    		
+	    		if(pConn->iCurrsequence != pMsgHeader->iCurrsequence)
+	    		{
+	    			pos2 = pos;
+	    			pos++;
+	    			pSocketObj->m_MsgSendQueue.erase(pos2);
+	    			--pSocketObj->m_iSendMsgQueueCount;
+	    			pMemory->FreeMemory(pMsgBuf);
+	    			continue;
+	    		}
+	    		
+	    		if(pConn->iThrowsendCount > 0)                                           //系统驱动发消息，不能再发送
+	    		{
+	    			pos++;
+	    			continue;
+	    		}
+	    		
+	    		pConn->psendMemPointer = pMsgBuf;
+	    		pos2 = pos;
+	    		pos++;
+	    		pSocketObj->m_MsgSendQueue.erase(pos2);
+	    		--pSocketObj->m_iSendMsgQueueCount;
+	    		pConn->psendbuf = (char *)pPkgHeader;                                   //发送消息体=包头+包体
+	    		itmp  =ntohs(pPkgHeader->pkgLen);
+	    		pConn->isendlen = itmp;
+	    		ngx_log_stderr(errno,"即将发送数据%ud。",pConn->isendlen);
+	    		sendsize = pSocketObj->sendproc(pConn,pConn->psendbuf,pConn->isendlen); //发送数据
+	    		if(sendsize >0)
+	    		{
+	    			if(sendsize == pConn->isendlen)                                     //成功发送了所有数据
+	    			{
+	    				pMemory->FreeMemory(pConn->psendMemPointer);                    //释放内存
+	    				pConn->psendMemPointer = NULL;
+	    				pConn->iThrowsendCount = 0;
+	    				ngx_log_stderr(0,"CSocekt::ServerSendQueueThread()中数据发送完毕，很好。");  //测试使用
+	    			}
+	    			else
+	    			{
+	    				pConn->psendbuf = pConn->psendbuf + sendsize;
+	    				pConn->isendlen = pConn->isendlen - sendsize;
+	    				++pConn->iThrowsendCount;
+	    				if(pSocketObj->ngx_epoll_oper_event(pConn->fd, EPOLL_CTL_MOD, EPOLLOUT, 0, pConn) == -1)
+	    				{
+	    					//有这情况发生？这可比较麻烦，不过先do nothing
+                            ngx_log_stderr(errno,"CSocekt::ServerSendQueueThread()ngx_epoll_oper_event()失败.");
+	    				}
+	    				ngx_log_stderr(errno,"CSocekt::ServerSendQueueThread()中数据没发送完毕【发送缓冲区满】，整个要发送%d，实际发送了%d。",pConn->isendlen,sendsize);
+	    			}
+	    			continue;
+	    		}//end if(sendsize >0)
+	    		else if(sendsize == 0)
+	    		{
+	    			//不可能出现这种错误，如果出现可能是对方关闭了连接，所以发送数据为0，直接丢弃掉这个包
+	    			pMemory->FreeMemory(pConn->psendMemPointer);   //释放内存
+	    			pConn->psendMemPointer = NULL;
+	    			pConn->iThrowsendCount = 0;
+	    			continue;
+	    		}
+	    		else if(sendsize == -1)
+	    		{
+	    			//发送缓冲区已满
+	    			++pConn->iThrowsendCount;
+	    			if(pSocketObj->ngx_epoll_oper_event(pConn->fd,EPOLL_CTL_MOD,EPOLLOUT,0,pConn) == -1)
+	    			{
+	    				 ngx_log_stderr(errno,"CSocekt::ServerSendQueueThread()中ngx_epoll_add_event()_2失败.");
+	    			}
+	    			continue;
+	    		}
+	    		else
+	    		{
+	    			pMemory->FreeMemory(pConn->psendMemPointer);  //释放内存
+                    pConn->psendMemPointer = NULL;
+                    pConn->iThrowsendCount = 0;  //这行其实可以没有，因此此时此刻这东西就是=0的    
+                    continue;
+	    		}
+	    		
+	    	}//while(pos != posend)
+	    	err = pthread_mutex_lock(&pSocketObj->m_sendMessageQueueMutex);
+	    	if(err != 0)
+	    	{
+	    		ngx_log_stderr(err,"CSocekt::ServerSendQueueThread()pthread_mutex_unlock()失败，返回的错误码为%d!",err);
+	    	}  
+	    }//pSocketObj->m_iSendMsgQueueCount
+	    
+	}
+	return (void*)0;
 }

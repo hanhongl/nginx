@@ -33,7 +33,7 @@ typedef bool (CLogicSocket::*handler)(lpngx_connection_t pConn,              //Á
 static const handler statusHandler[] = 
 {
 	//Ç°Îå¸öÔªËØ±£Áô£¬´ıÍØÕ¹
-	NULL,                                       //¡¾0¡¿
+	&CLogicSocket::_HandlePing,                 //¡¾0¡¿ĞÄÌø°ü¹¦ÄÜ
 	NULL,                                       //¡¾1¡¿
 	NULL,                                       //¡¾2¡¿
 	NULL,                                       //¡¾3¡¿
@@ -121,10 +121,72 @@ void CLogicSocket::threadRecvProcFunc(char *pMsgBuf)
     (this->*statusHandler[imsgCode])(pConn,pMsgHeader,(char *)pPkgBody,pkglen-m_iLenPkgHeader);
     return;	
 }
+
+
 //´¦Àí¸÷ÖÖÒµÎñÂß¼­
+
+//ĞÄÌø°ü³¬Ê±¼ì²âº¯Êı
+void CLogicSocket::procPingTimeOutChecking(LPSTRUC_MSG_HEADER tmpmsg,time_t cur_time)
+{
+	CMemory *pMemory = CMemory::GetInstance();
+	
+	if(tmpmsg->iCurrsequence == tmpmsg->pConn->iCurrsequence)                       //Á¬½Ó´æÔÚ
+	{
+		lpngx_connection_t pConn = tmpmsg->pConn;
+		if(m_ifTimeOutKick == 1)
+		{
+			zdClosesocketProc(pConn);
+		}
+		else if((cur_time - pConn->lastPingTime) > m_iWaitTime*3 + 10)
+		{
+			//ngx_log_stderr(0,"Ê±¼äµ½²»·¢ĞÄÌø°ü£¬Ìß³öÈ¥!");   //¸Ğ¾õOK
+			zdClosesocketProc(pConn); 
+		}
+		pMemory->FreeMemory(tmpmsg);
+	}
+	else
+	{
+		pMemory->FreeMemory(tmpmsg);
+	}
+}
+
+//Ö»·¢ËÍ°üÍ·µÄº¯Êı
+void CLogicSocket::SendNoBodyPkgToClient(LPSTRUC_MSG_HEADER pMsgHeader,unsigned short iMsgCode)
+{
+	CMemory *pMemory = CMemory::GetInstance();
+	
+	char *pSendBuf = (char *) pMemory->AllocMemory(m_iLenMsgHeader+m_iLenPkgHeader, false);
+	char *pTmpBuf  = pSendBuf;
+	memcpy(pTmpBuf,pMsgHeader,m_iLenMsgHeader);
+	pTmpBuf += m_iLenMsgHeader;
+	
+	LPCOMM_PKG_HEADER pPkgHeader = (LPCOMM_PKG_HEADER) pTmpBuf;  //ÄÃµ½Òª·¢ËÍµÄ°üÍ·
+	pPkgHeader->msgCode = htons(iMsgCode);
+	pPkgHeader->pkgLen  = htons(m_iLenPkgHeader);
+	pPkgHeader->crc32   = 0;
+	msgSend(pSendBuf);
+	return;
+}
+
+//ĞÄÌø°üÊµÏÖ
+bool CLogicSocket::_HandlePing(lpngx_connection_t pConn,LPSTRUC_MSG_HEADER pMsgHeader,char *pPkgBody,unsigned short iBodyLength)
+{
+	if(iBodyLength != 0)            //ĞÄÌø°üÉè¼ÆÖ»ÓĞ°üÍ·£¬ÎŞ°üÌå£¬ËùÒÔÓĞ°üÌåÈÏÎªÊÇ·Ç·¨°ü
+	{
+		return false;
+	}
+	
+	CLock(&pConn->logicPorcMutex);
+	pConn->lastPingTime = time(NULL);
+	SendNoBodyPkgToClient(pMsgHeader,_CMD_PING);
+	ngx_log_stderr(0,"this is pkg is heartbeat.");
+	return true;
+}
+
+//×¢²á°ü
 bool CLogicSocket::_HandleRegister(lpngx_connection_t pConn,LPSTRUC_MSG_HEADER pMsgHeader,char *pPkgBody,unsigned short iBodyLength)
 {
-	/*if(pPkgBody == NULL)
+	if(pPkgBody == NULL)
 	{
 		return false;
 	}
@@ -138,6 +200,9 @@ bool CLogicSocket::_HandleRegister(lpngx_connection_t pConn,LPSTRUC_MSG_HEADER p
 	CLock lock(&pConn->logicPorcMutex);
 	
 	LPSTRUCT_REGISTER pRecvInfo = (LPSTRUCT_REGISTER)pPkgBody;    //È¡µÃ°üÌåÊı¾İ
+	pRecvInfo->iType    = ntohl(pRecvInfo->iType);
+	pRecvInfo->username[sizeof(pRecvInfo->username) - 1] = 0;
+	pRecvInfo->password[sizeof(pRecvInfo->password) - 1] = 0;
 	
     //»ØÏûÏ¢°üÓ¦ÓÃ
 	LPCOMM_PKG_HEADER pPkgHeader;
@@ -157,20 +222,18 @@ bool CLogicSocket::_HandleRegister(lpngx_connection_t pConn,LPSTRUC_MSG_HEADER p
 	//¼ÆËã°üÌåCRC32Öµ
 	pPkgHeader->crc32 = pCrc32->Get_CRC((unsigned char*)pSendInfo,iSendLen);
 	pPkgHeader->crc32 = htonl(pPkgHeader->crc32);
-	//f)·¢ËÍÊı¾İ°ü
-    /*msgSend(p_sendbuf);
+	//·¢ËÍÊı¾İ°ü
+    msgSend(pSendBuf);
     //Èç¹ûÊ±»úOK²Åadd_event
-    if(ngx_epoll_add_event(pConn->fd,                 //socket¾ä±ú
-                                0,1,              //¶Á£¬Ğ´ ,ÕâÀï¶ÁÎª1£¬±íÊ¾¿Í»§¶ËÓ¦¸ÃÖ÷¶¯¸øÎÒ·şÎñÆ÷·¢ËÍÏûÏ¢£¬ÎÒ·şÎñÆ÷ĞèÒªÊ×ÏÈÊÕµ½¿Í»§¶ËµÄÏûÏ¢£»
-                                0,//EPOLLET,      //ÆäËû²¹³ä±ê¼Ç¡¾EPOLLET(¸ßËÙÄ£Ê½£¬±ßÔµ´¥·¢ET)¡¿
-                                                      //ºóĞøÒòÎªÊµ¼ÊÏîÄ¿ĞèÒª£¬ÎÒÃÇ²ÉÓÃLTÄ£Ê½¡¾Ë®Æ½´¥·¢Ä£Ê½/µÍËÙÄ£Ê½¡¿
-                                EPOLL_CTL_MOD,    //ÊÂ¼şÀàĞÍ¡¾Ôö¼Ó£¬»¹ÓĞÉ¾³ı/ĞŞ¸Ä¡¿                                    
-                                pConn              //Á¬½Ó³ØÖĞµÄÁ¬½Ó
-                                ) == -1)
-                                {
-                                    //ngx_log_stderr(0,"111111111111!");
-                                }
-    */
+    /*if(ngx_epoll_oper_event(pConn->fd,                 //socket¾ä±ú
+                            EPOLL_CTL_MOD,
+                            EPOLLOUT,              //¶Á£¬Ğ´ ,ÕâÀï¶ÁÎª1£¬±íÊ¾¿Í»§¶ËÓ¦¸ÃÖ÷¶¯¸øÎÒ·şÎñÆ÷·¢ËÍÏûÏ¢£¬ÎÒ·şÎñÆ÷ĞèÒªÊ×ÏÈÊÕµ½¿Í»§¶ËµÄÏûÏ¢£»
+                            0,                                                      
+                            pConn) == -1)
+                      {
+                           ngx_log_stderr(0,"111111111111!");
+                      }
+    
 
    /*
     sleep(100);  //ĞİÏ¢ÕâÃ´³¤Ê±¼ä
@@ -189,6 +252,8 @@ bool CLogicSocket::_HandleRegister(lpngx_connection_t pConn,LPSTRUC_MSG_HEADER p
     ngx_log_stderr(0,"Ö´ĞĞÁËCLogicSocket::_HandleRegister()!");
     return true;
 }
+
+//µÇÂ¼°ü
 bool CLogicSocket::_HandleLogin(lpngx_connection_t pConn,LPSTRUC_MSG_HEADER pMsgHeader,char *pPkgBody,unsigned short iBodyLength)
 {
     ngx_log_stderr(0,"Ö´ĞĞÁËCLogicSocket::_HandleLogIn()!");

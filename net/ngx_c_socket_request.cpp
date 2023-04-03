@@ -21,8 +21,9 @@
 #include "ngx_c_memory.h"
 #include "ngx_c_lockmutex.h"  //自动释放互斥量的一个类
 //来数据时候的处理，当连接上有数据来的时候，本函数会被ngx_epoll_process_events()所调用  ,官方的类似函数为ngx_http_wait_request_handler();
-void CSocket::ngx_wait_request_handler(lpngx_connection_t pConn)
-{  
+void CSocket::ngx_read_request_handler(lpngx_connection_t pConn)
+{ 
+	bool isflood = false; 
     ssize_t reco = recvproc(pConn,pConn->precvbuf,pConn->irecvlen);
     if(reco <= 0 )
     {
@@ -32,7 +33,7 @@ void CSocket::ngx_wait_request_handler(lpngx_connection_t pConn)
     {
     	if(reco == m_iLenPkgHeader)      //接收到完整包头
     	{
-    		ngx_wait_request_handler_proc_p1(pConn);
+    		ngx_wait_request_handler_proc_p1(pConn,isflood);
     	}
     	else
     	{
@@ -45,7 +46,7 @@ void CSocket::ngx_wait_request_handler(lpngx_connection_t pConn)
     {
     	if(pConn->irecvlen == reco)           //收到完整包头
     	{
-    		ngx_wait_request_handler_proc_p1(pConn);
+    		ngx_wait_request_handler_proc_p1(pConn,isflood);
     	}
     	else
     	{
@@ -57,7 +58,11 @@ void CSocket::ngx_wait_request_handler(lpngx_connection_t pConn)
     {
     	if(reco = pConn->irecvlen)           //接收到完整包体
     	{
-    		ngx_wait_request_handler_proc_plast(pConn);
+    		if(m_floodAkEnable == 1)
+    		{
+    			isflood = TestFlood(pConn);
+    		}
+    		ngx_wait_request_handler_proc_plast(pConn,isflood);
     	}
     	else
     	{
@@ -70,17 +75,64 @@ void CSocket::ngx_wait_request_handler(lpngx_connection_t pConn)
     {
     	if(pConn->irecvlen == reco)          //收到剩余所有包体
     	{
-    		ngx_wait_request_handler_proc_plast(pConn);
+    		if(m_floodAkEnable == 1)
+    		{
+    			isflood = TestFlood(pConn);
+    		}
+    		ngx_wait_request_handler_proc_plast(pConn,isflood);
     	}
     	else
     	{
     		pConn->precvbuf = pConn->precvbuf + reco;
     		pConn->irecvlen = pConn->irecvlen - reco;
     	}
+    }
+    
+    if(isflood == true)
+    {
+    	 zdClosesocketProc(pConn);
     } 
     return;
 }
 
+//设置数据来时的写处理函数
+void CSocket::ngx_write_request_handler(lpngx_connection_t pConn)         
+{
+	CMemory *pMemory = CMemory::GetInstance();
+	
+	ssize_t sendsize = sendproc(pConn, pConn->psendbuf, pConn->isendlen);
+	if(sendsize >0 && sendsize != pConn->isendlen)                       //数据未发送完毕
+	{
+		pConn->psendbuf = pConn->psendbuf + sendsize;
+		pConn->isendlen = pConn->isendlen - sendsize;
+		return;
+	}
+	else if(sendsize == -1)
+	{
+		//这不太可能，可以发送数据时通知write发送数据，发送时系统却通知我发送缓冲区满？
+        ngx_log_stderr(errno,"CSocekt::ngx_write_request_handler()时if(sendsize == -1)成立，这很怪异。"); //打印个日志
+        return;
+	}
+	
+	if(sendsize > 0 && sendsize == pConn->isendlen)                                        //数据发送完毕，干掉红黑树中的写事件
+	{
+		if(ngx_epoll_oper_event(pConn->fd, EPOLL_CTL_MOD, EPOLLOUT, 1, pConn) == -1)
+		{
+			ngx_log_stderr(errno,"CSocekt::ngx_write_request_handler()中ngx_epoll_oper_event()失败。");
+		}
+		 ngx_log_stderr(0,"CSocekt::ngx_write_request_handler()中数据发送完毕，很好。");
+	}
+	
+	if(sem_post(&m_semEventSendQueue) == -1)
+	{
+		 ngx_log_stderr(0,"CSocekt::ngx_write_request_handler()中sem_post(&m_semEventSendQueue)失败.");
+	}
+	pMemory->FreeMemory(pConn->psendMemPointer);
+	pConn->psendMemPointer = NULL;
+	--pConn->iThrowsendCount;
+	
+	return ;
+}
 ssize_t CSocket::recvproc(lpngx_connection_t c,char *buff,ssize_t buflen)     //接收消息
 {
 	ssize_t n;
@@ -89,11 +141,7 @@ ssize_t CSocket::recvproc(lpngx_connection_t c,char *buff,ssize_t buflen)     //
 	{
         //ngx_log_stderr(0,"连接被客户端正常关闭[4路挥手关闭]！");
         //ngx_close_connection(c);
-        if(close(c->fd) == -1)
-        {
-            ngx_log_error_core(NGX_LOG_ALERT,errno,"CSocekt::recvproc()中close(%d)失败!",c->fd);  
-        }
-        inRecyConnectQueue(c);                      //放入延迟回收队列
+        zdClosesocketProc(c);
 		return -1;
 	}
 	//客户端连接还在
@@ -119,18 +167,14 @@ ssize_t CSocket::recvproc(lpngx_connection_t c,char *buff,ssize_t buflen)     //
 		}
 		//ngx_log_stderr(0,"连接被客户端 非 正常关闭！");
 		//ngx_close_connection(c);
-		if(close(c->fd) == -1)
-        {
-            ngx_log_error_core(NGX_LOG_ALERT,errno,"CSocekt::recvproc()中close_2(%d)失败!",c->fd);  
-        }
-        inRecyConnectQueue(c);
+		zdClosesocketProc(c);
 		return -1;
 	}
 	return n;
 }
 
 //包处理阶段1添加消息头，存包头
-void CSocket::ngx_wait_request_handler_proc_p1(lpngx_connection_t pConn)
+void CSocket::ngx_wait_request_handler_proc_p1(lpngx_connection_t pConn,bool &isflood)
 {
 	CMemory *pMemory = CMemory::GetInstance();
 	
@@ -154,7 +198,6 @@ void CSocket::ngx_wait_request_handler_proc_p1(lpngx_connection_t pConn)
 	{
 		//合法包头
 		char *pTmpBuffer  = (char *)pMemory->AllocMemory(m_iLenMsgHeader + e_pkgLen,false);  //消息头+消息体
-		//c->ifnewrecvMem   = true;
 		pConn->precvMemPointer = pTmpBuffer;
 		
 		//先填写消息头
@@ -167,7 +210,11 @@ void CSocket::ngx_wait_request_handler_proc_p1(lpngx_connection_t pConn)
 		memcpy(pTmpBuffer,pPkgHeader,m_iLenPkgHeader);
 		if(e_pkgLen == m_iLenPkgHeader)
 		{
-			ngx_wait_request_handler_proc_plast(pConn);
+			if(m_floodAkEnable == 1)
+			{
+				isflood = TestFlood(pConn);
+			}
+			ngx_wait_request_handler_proc_plast(pConn,isflood);
 		}
 		else
 		{
@@ -180,15 +227,21 @@ void CSocket::ngx_wait_request_handler_proc_p1(lpngx_connection_t pConn)
 }
 
 //包处理阶段二 ，完整包之后的处理
-void CSocket::ngx_wait_request_handler_proc_plast(lpngx_connection_t pConn)
+void CSocket::ngx_wait_request_handler_proc_plast(lpngx_connection_t pConn,bool &isflood)
 {
 	//将消息放入接收消息处理队列
 	//int irmqc = 0;
 	//inMsgRecvQueue(c->precvMemPointer,irmqc);
 	//g_threadpool.Call(irmqc);
-	
-	g_threadpool.inMsgRecvQueueAndSignal(pConn->precvMemPointer);
-	
+	if(isflood == false)
+	{
+		g_threadpool.inMsgRecvQueueAndSignal(pConn->precvMemPointer);
+	}
+    else
+    {
+    	CMemory *pMemory = CMemory::GetInstance();
+    	pMemory->FreeMemory(pConn->precvMemPointer);                     //释放内存
+    }
 	//参数处理
 	//pConn->ifnewrecvMem   = false;
 	pConn->precvMemPointer = NULL;
